@@ -21,51 +21,151 @@ info, and produce a ready-to-use recruiting candidate list.
 
 ## Inputs
 
-- **repo** (required): GitHub repo in `owner/repo` format, or a full GitHub URL
-- **limit** (optional): How many recent closed PRs to scan. Default: 100
+- **repo** (required): GitHub repo in `owner/repo` format, full GitHub URL, **or a topic/keyword**
+  when the user doesn't have a specific repo in mind (e.g. "AI data infra repos with Chinese contributors")
+- **limit** (optional): How many recent closed PRs or commits to scan. Default: 100
 - **role** (optional): The role you're recruiting for. Default: "Data Infra Tech Lead"
 
 If the user provides a full URL like `https://github.com/ray-project/ray`, extract `ray-project/ray`.
 If only a repo name is given (e.g., "vllm"), ask the user to confirm the owner before proceeding.
+**If a topic/keyword is given instead of a repo**, switch to Repo Discovery Mode (see below).
 
-## Execution
+## API Access
 
-Work through these steps sequentially. Use `WebFetch` for all GitHub API calls.
+**Always prefer Python urllib over WebFetch for GitHub API calls.** Use this pattern:
 
-### Step 1: Fetch closed PRs
+```python
+import urllib.request, json
 
+def gh_get(path):
+    url = f"https://api.github.com{path}"
+    req = urllib.request.Request(url, headers={
+        'User-Agent': 'Mozilla/5.0',
+        'Accept': 'application/vnd.github+json'
+    })
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read())
 ```
-GET https://api.github.com/repos/{owner}/{repo}/pulls?state=closed&sort=updated&direction=desc&per_page=100
-```
 
-Collect unique contributor `login` values from `pull.user.login`. Skip bots (logins containing
-`[bot]` or ending in `-bot`). If `limit` is less than 100, fetch only the first page accordingly.
-
-**Rate limit handling**: If you get a 403 or see `X-RateLimit-Remaining: 0`, stop immediately and
-tell the user:
+**Rate limit handling**: If you get a 403 or `HTTP Error 403`, stop and tell the user:
 > GitHub API rate limit reached (60 req/hour without authentication). Add a token at
 > https://github.com/settings/tokens and pass it to me as "use token: ghp_xxx" to continue.
 
+---
+
+## Mode A: Repo Discovery Mode
+
+**Trigger**: User provides a topic/keyword instead of a specific repo (e.g. "LLM training data infra").
+
+1. Use **WebSearch** with multiple queries to find candidate repos matching the topic
+2. Filter: Stars > 100 · Created/active in last 5 years · Chinese contributor signals in description/org
+3. Return a ranked table of repos, then ask: "要对哪个 repo 做精细扫描？"
+4. Continue to Mode B with the selected repo.
+
+---
+
+## Mode B: Repo Scan Mode
+
+### Step 0: Detect repo type — choose scan strategy
+
+First, quickly check PR count and commit pattern to classify the repo:
+
+```python
+pulls = gh_get(f"/repos/{owner}/{repo}/pulls?state=closed&per_page=5")
+pr_count = len(pulls)
+```
+
+| PR count | Repo type | Strategy |
+|---|---|---|
+| ≥ 10 | Community open source | **PR mode** (original Step 1) |
+| < 10 | Enterprise internal / research repo | **Commit mode** (Step 1B) |
+
+**Enterprise research repo signals** (switch to Commit mode if 2+ match):
+- Fewer than 10 closed PRs
+- Commits go directly to main without PR
+- Org name is a company (`ByteDance-Seed`, `KwaiVGI`, `OpenDriveLab`, etc.)
+- README contains an arXiv link (`arxiv.org/abs/`)
+
+---
+
+### Step 1A: PR Mode — Fetch closed PRs (community repos)
+
+```
+GET /repos/{owner}/{repo}/pulls?state=closed&sort=updated&direction=desc&per_page=100
+```
+
+Collect unique contributor `login` values from `pull.user.login`. Skip bots (logins containing
+`[bot]` or ending in `-bot`).
+
+---
+
+### Step 1B: Commit Mode — Fetch commits + arXiv authors (enterprise/research repos)
+
+**1B-1: Scan commits**
+```
+GET /repos/{owner}/{repo}/commits?per_page=100
+```
+For each commit, extract: `author.login`, `commit.author.name`, `commit.author.email`, `commit.author.date`.
+
+Collect unique logins + their commit count, latest commit date, and commit email.
+
+**1B-2: arXiv paper tracing (critical for research repos)**
+
+Fetch the README and scan for `arxiv.org/abs/` URLs:
+```
+GET /repos/{owner}/{repo}/readme
+```
+Decode base64 content. Extract all arXiv IDs (pattern: `\d{4}\.\d{4,5}`).
+
+For each arXiv ID found, fetch the paper page to extract all co-authors and their affiliations:
+```
+WebSearch: "arxiv {arXiv_id} authors affiliations"
+```
+or fetch `https://arxiv.org/abs/{arXiv_id}` directly.
+
+**Merge commit authors + paper authors** into a single candidate list. Mark each person's source:
+- `[commit]` — appeared in git history
+- `[paper]` — listed as paper author but no commit
+- `[both]` — commit author AND paper author
+
+The paper author list often reveals the full team, including leads who don't push code directly
+but are responsible for data pipeline design and architecture.
+
+---
+
 ### Step 2: Enrich each contributor profile
 
-For each unique login:
+For each unique login (commit authors) or name (paper-only authors):
 
+**For GitHub logins:**
 ```
-GET https://api.github.com/users/{login}
+GET /users/{login}
 ```
+Extract: `name`, `email`, `company`, `location`, `bio`, `blog`, `html_url`, `followers`.
 
-Extract: `name`, `email`, `company`, `location`, `bio`, `blog` (personal website), `html_url`,
-`avatar_url`.
+**For paper-only authors (no GitHub login):**
+Search `"{name} {affiliation} github"` to find their GitHub profile.
 
-**Email fallback** — only if `email` is null:
-```
-GET https://api.github.com/repos/{owner}/{repo}/commits?author={login}&per_page=3
-```
-Take `items[0].commit.author.email`. Discard if it matches `*@users.noreply.github.com`.
+---
+
+### Step 3: Email extraction — 4-source strategy
+
+Attempt each source in order, stop when found:
+
+| Source | Method | Example yield |
+|---|---|---|
+| **① commit metadata** | From Step 1B commit data: `commit.author.email` | `renzhongwei@bytedance.com` |
+| **② paper corresponding author** | Fetch arXiv PDF/abstract, look for footnote `*Corresponding author` or `†` with email | `jinxiaojie@bytedance.com` |
+| **③ GitHub profile** | `user.email` field | `user@company.com` |
+| **④ personal homepage** | Fetch `user.blog` URL, scan HTML for `mailto:` hrefs and `@` patterns | `name@lab.edu` |
+
+Discard emails matching `*@users.noreply.github.com`.
+If only domain is found (e.g. from Google Scholar "Verified email at bytedance.com"),
+record as `? @ bytedance.com` — still useful as a partial lead.
 
 Count how many PRs each login contributed (from Step 1 data).
 
-### Step 3: Identify Chinese contributors
+### Step 4: Identify Chinese contributors
 
 Score each contributor against these signals. You're looking for people who are ethnically Chinese,
 including mainland China, Taiwan, Hong Kong, Singapore, and overseas Chinese diaspora.
@@ -84,10 +184,13 @@ including mainland China, Taiwan, Hong Kong, Singapore, and overseas Chinese dia
   Nanjing, Chongqing, Suzhou, Xi'an, Tianjin, Hong Kong, Taiwan, Singapore, 北京, 上海, 深圳
 - `company` mentions a Chinese tech company: ByteDance, Baidu, Alibaba, Tencent, Huawei, Meituan,
   JD.com, Didi, Kuaishou, Ant Group, NetEase, PingCAP, 字节, 百度, 阿里, 腾讯, 华为, 美团
+- bio contains Chinese text or mentions Chinese institutions
 
 **Skip** contributors with no signals. Include all high + medium confidence contributors in output.
 
-### Step 4: Build output
+---
+
+### Step 5: Build output
 
 For each Chinese contributor, generate their LinkedIn search URL:
 ```
@@ -95,7 +198,9 @@ https://www.linkedin.com/search/results/people/?keywords={URL-encoded name or lo
 ```
 Prefer real name over login for better search results.
 
-### Step 5: Write the output file
+---
+
+### Step 6: Write the output file
 
 Save to: `github-digger-{repo-name}-{YYYY-MM-DD}.md` in the current working directory.
 
@@ -108,23 +213,26 @@ Use exactly this structure:
 
 ## 找人结果概览
 
-从 {repo} 项目的最近 closed PR 中，找到 **{high} 位高置信度华人贡献者**，以及额外 **{medium} 位待确认的候选**。
+**扫描策略：** {PR模式 / Commit模式（企业内部 research repo，PR数 < 10）}  
+**arXiv 论文溯源：** {是/否} — {论文标题，如有}
+
+从 {repo} 项目中，找到 **{high} 位高置信度华人贡献者**，以及额外 **{medium} 位待确认的候选**。
 
 ---
 
 ## 第一梯队：高置信度华人贡献者 ({high}位)
 
-| 排名 | GitHub | 真实姓名 | 邮箱 | 公司 | 地点 | 网站 | 置信度 | PR数 | 最新活跃 |
-|------|--------|---------|------|------|------|------|--------|------|---------|
-| 1 | [login](github_url) | name or — | email or ⚠️ | company or — | location or — | [网站](blog_url) or — | 🟢高 | n | YYYY-MM-DD |
+| 排名 | GitHub | 真实姓名 | 邮箱 | 邮箱来源 | 公司 | 地点 | 来源 | 贡献 | 最新活跃 |
+|------|--------|---------|------|---------|------|------|------|------|---------|
+| 1 | [login](github_url) | name | email or ⚠️ | commit/paper/profile/homepage | company | location | [commit]/[paper]/[both] | n commits or 论文作者 | YYYY-MM-DD |
 
 ---
 
 ## 第二梯队：中置信度候选 ({medium}位)
 
-| GitHub | 真实姓名 | 邮箱 | 公司 | 地点 | 置信度 | PR数 | 可能身份 |
-|--------|---------|------|------|------|--------|------|---------|
-| [login](github_url) | name or — | — | — | — | 🟡中 | n | 拼音特征/location信号 |
+| GitHub | 真实姓名 | 邮箱 | 公司 | 地点 | 来源 | 可能身份 |
+|--------|---------|------|------|------|------|---------|
+| [login](github_url) | name or — | — | — | — | [commit]/[paper] | 拼音特征/location信号 |
 
 ---
 
@@ -132,60 +240,49 @@ Use exactly this structure:
 
 ### 优先联系（第一梯队 - 高置信度 + 有邮箱）
 
-这些是最优先的目标：
-
 **1. {name}** (@{login})
-- 📧 {email} （有邮箱，可直接联系）
+- 📧 {email}（邮箱来源：{commit metadata / 论文对应作者脚注 / GitHub profile / 个人主页}）
 - 🏢 {company} · {location}
-- 💻 PR 贡献：{pr_count} 个，最近活跃：{latest_pr_date}
-- 🔗 GitHub Profile: {github_url}
-
-**2. {name}** (@{login})
-- 📧 ⚠️ 无公开邮箱 → 可通过 GitHub profile 联系或 LinkedIn 搜索
-- 🏢 {company} · {location}
-- 💻 PR 贡献：{pr_count} 个，最近活跃：{latest_pr_date}
-- 🔗 GitHub Profile: {github_url} | LinkedIn: {linkedin_search_url}
+- 💻 贡献：{n commits / 论文作者} — 最近活跃：{latest_date}
+- 🔗 GitHub: {github_url} | LinkedIn: {linkedin_search_url}
 
 ---
 
 ### 联系方式
 
-1. **有邮箱的候选人**：直接发邮件，展示对其 GitHub 贡献的了解
+1. **有邮箱的候选人**：直接发邮件，展示对其具体贡献的了解（commit message / 论文模块）
 2. **无邮箱的候选人**：
    - 访问 GitHub profile，查看个人网站或联系方式
    - 在 LinkedIn 搜索，用真实姓名或用户名
    - 查看其开源项目的 discussions / issues 留言
-3. **公司信号**：通过公司内部邮件或 LinkedIn 找到对应团队
+3. **仅在论文中出现（无 GitHub）**：通过 arXiv 脚注 email 或机构主页联系
 
 ---
 
 ### 推荐的挖角话术
 
-针对 **{role}** 的 LinkedIn 消息（英文）：
+针对 **{role}** 的邮件/LinkedIn 消息（英文）：
 
 > Hi {name},
 >
-> I noticed your contributions to {repo}, particularly your work on [具体PR名]. We're building
-> {role} at [Your Company], and your expertise in [相关技术领域] is exactly what we're looking for.
+> I noticed your contributions to {repo} — particularly your work on [具体commit描述 or 论文模块].
+> We're building {role} at [Your Company], and your expertise in [相关技术领域] is exactly what
+> we're looking for.
 >
-> We're a [公司背景：Pre-IPO/Series X/成长阶段] focused on [核心方向]. The role offers [独特优势：
-> 直接汇报、高度自主权、技术深度等].
+> We're [公司背景] focused on [核心方向]. The role offers [独特优势].
 >
-> Would you be open to a quick 15-minute chat to learn more about what we're building?
->
-> Looking forward to hearing from you!
+> Would you be open to a quick 15-minute chat?
 
-中文版本（如果候选人是中国开发者）：
+中文版本：
 
 > 你好 {name}，
 >
-> 我注意到你在 {repo} 上的贡献，特别是 [具体PR名]。我们在 [公司名] 正在建设 {role}，
+> 我注意到你在 {repo} 的贡献，特别是 [具体commit/论文模块]。我们在 [公司名] 正在建设 {role}，
 > 你在 [技术领域] 的经验正好是我们需要的。
 >
-> 我们是一家 [融资阶段] 的公司，专注于 [方向]。这个职位 [独特卖点：直接汇报创始人、充分自主权等]。
-> 薪酬范围：[具体数字]
+> 我们是一家 [融资阶段] 的公司，专注于 [方向]。[独特卖点]。
 >
-> 有兴趣聊一下吗？随时可以。
+> 有兴趣聊一下吗？
 
 ---
 
@@ -193,37 +290,20 @@ Use exactly this structure:
 
 如果需要更多候选，可考虑：
 
-1. **其他头部开源项目**
-   - vLLM、LLaMA、Hugging Face transformers
-   - Databricks、MLflow 相关项目
-   - PyTorch、TensorFlow 子项目
-
-2. **特定技术领域**
-   - 分布式系统：etcd、Kubernetes、TiDB
-   - AI/ML：fairseq、Megatron-LM、ColossalAI
-   - Data：Apache Spark、Parquet、Arrow
-
-3. **学术和会议渠道**
-   - arXiv 论文作者（按领域搜索）
-   - MLSys、NeurIPS、ICML 讲者
-
-4. **公司官方团队**
-   - 项目官方治理页面（如 Ray docs/governance）
-   - 核心贡献者通常在公司员工名单中
+1. **同一企业 Org 的其他 repo** — `org:{org_name}` 下同类项目，共享工程师池
+2. **论文共同作者** — 追溯论文其他作者的 GitHub / 个人主页
+3. **arXiv 同领域论文** — 搜索同方向近期论文，追踪第一作者/对应作者
+4. **相关开源生态** — 引用该 repo 的其他项目贡献者
 
 ---
 
 ## 数据来源与说明
 
 - **扫描时间：** {YYYY-MM-DD}
-- **扫描范围：** 最近 {limit} 个 closed PR
+- **扫描策略：** {PR模式（最近 N 个 closed PR）/ Commit模式（最近 N 个 commits + arXiv 溯源）}
 - **发现总数：** {total} 位候选人（高 {high} / 中 {medium}）
 - **邮箱覆盖率：** {email_count}/{total} ({email_rate}%)
-
-### 关于邮箱
-
-所有邮箱均来自 GitHub 公开数据（profile + commit 元数据），不涉及隐私信息。
-约 20-30% 的 GitHub 用户会公开邮箱，其余候选人可通过其他渠道（LinkedIn、个人网站等）联系。
+- **邮箱来源分布：** commit metadata {n} / 论文脚注 {n} / GitHub profile {n} / 个人主页 {n}
 
 ---
 
@@ -236,10 +316,12 @@ Use exactly this structure:
 
 Tell the user:
 1. Where the file was saved
-2. Total candidates found and breakdown (high/medium confidence)
-3. How many have public emails
-4. If fewer than 3 Chinese contributors were found, suggest: scanning more PRs (increase limit),
-   trying a related repo, or that this project may have few Chinese contributors
+2. Scan strategy used (PR mode vs Commit mode) and why
+3. Total candidates found and breakdown (high/medium confidence)
+4. How many have confirmed emails and which source each came from
+5. If arXiv tracing was triggered: how many additional paper-only authors were found beyond commit authors
+6. If fewer than 3 Chinese contributors were found, suggest: scanning more commits, trying related
+   repos in the same org, or checking the arXiv paper's full author list
 
 If the user asks for a personalized message for a specific candidate, generate one using their
-actual PR titles, company, and background. Keep it under 150 words and conversational, not salesy.
+actual commit messages or paper module names, company, and background. Keep it under 150 words.
